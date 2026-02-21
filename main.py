@@ -156,6 +156,42 @@ async def test_page():
         .error { background-color: #fee2e2; color: #991b1b; border: 1px solid #f87171; }
         .success { background-color: #dcfce7; color: #166534; border: 1px solid #4ade80; }
         .info { background-color: #e0f2fe; color: #075985; border: 1px solid #7dd3fc; }
+        
+        /* Progress Bar Styles */
+        .progress-group {
+            margin-top: 1.5rem;
+            display: none;
+        }
+        .progress-label {
+            font-size: 0.875rem;
+            margin-bottom: 0.5rem;
+            display: flex;
+            justify-content: space-between;
+        }
+        .progress-bar-container {
+            width: 100%;
+            height: 10px;
+            background: #e2e8f0;
+            border-radius: 5px;
+            overflow: hidden;
+            margin-bottom: 1rem;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--primary);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        .progress-bar-fill.indeterminate {
+            width: 100%;
+            background: linear-gradient(90deg, #2563eb 25%, #60a5fa 50%, #2563eb 75%);
+            background-size: 200% 100%;
+            animation: move-bg 1.5s infinite linear;
+        }
+        @keyframes move-bg {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
     </style>
 </head>
 <body>
@@ -177,7 +213,24 @@ async def test_page():
             <input type="file" id="fileInput" accept=".xlsx,.xls,.xlsb,.csv" required>
         </div>
 
-        <button id="testBtn">Process File</button>
+        <button id="testBtn">Upload & Process File</button>
+
+        <div class="progress-group" id="progressGroup">
+            <div class="progress-label">
+                <span>Uploading...</span>
+                <span id="uploadPct">0%</span>
+            </div>
+            <div class="progress-bar-container">
+                <div class="progress-bar-fill" id="uploadBar"></div>
+            </div>
+
+            <div class="progress-label" id="convertLabel" style="display:none">
+                <span>Processing & Filtering (Please Wait)...</span>
+            </div>
+            <div class="progress-bar-container" id="convertBarContainer" style="display:none">
+                <div class="progress-bar-fill indeterminate"></div>
+            </div>
+        </div>
 
         <div id="status"></div>
     </div>
@@ -186,8 +239,13 @@ async def test_page():
         document.getElementById('bridgeUrl').value = window.location.origin;
         const testBtn = document.getElementById('testBtn');
         const statusDiv = document.getElementById('status');
+        const progressGroup = document.getElementById('progressGroup');
+        const uploadBar = document.getElementById('uploadBar');
+        const uploadPct = document.getElementById('uploadPct');
+        const convertLabel = document.getElementById('convertLabel');
+        const convertBarContainer = document.getElementById('convertBarContainer');
 
-        testBtn.addEventListener('click', async () => {
+        testBtn.addEventListener('click', () => {
             const bridgeUrl = document.getElementById('bridgeUrl').value.trim();
             const jobId = document.getElementById('jobId').value.trim();
             const fileInput = document.getElementById('fileInput');
@@ -209,17 +267,66 @@ async def test_page():
 
             const uploadUrl = `${bridgeUrl}/process`;
 
+            // Reset UI
             statusDiv.style.display = 'none';
+            progressGroup.style.display = 'block';
+            convertLabel.style.display = 'none';
+            convertBarContainer.style.display = 'none';
+            uploadBar.style.width = '0%';
+            uploadPct.textContent = '0%';
             testBtn.disabled = true;
-            showStatus('Uploading & Processing...', 'info');
 
-            fetch(uploadUrl, {
-                method: 'POST',
-                body: formData
-            })
-            .then(async response => {
-                if (response.ok) {
-                    const blob = await response.blob();
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', uploadUrl, true);
+            xhr.responseType = 'blob'; // Expect binary blob for download success
+            
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    uploadBar.style.width = percent + '%';
+                    uploadPct.textContent = percent + '%';
+                    
+                    if (percent === 100) {
+                        setTimeout(() => {
+                            convertLabel.style.display = 'flex';
+                            convertBarContainer.style.display = 'block';
+                            addLog('Upload complete. Parsing sheets...');
+                        }, 200);
+                    }
+                }
+            };
+            
+            // Simulation of console logs while waiting for the server
+            let logInterval;
+            xhr.onloadstart = () => {
+                statusDiv.style.display = 'block';
+                statusDiv.className = 'info';
+                statusDiv.innerHTML = '<strong>Server Logs:</strong><br>';
+                addLog('Connecting to server...');
+                
+                // Simulate process logs after upload completes
+                setTimeout(() => {
+                    if(!testBtn.disabled) return;
+                    addLog('Extracting dataset...');
+                    
+                    let ticks = 0;
+                    logInterval = setInterval(() => {
+                        ticks++;
+                        if (ticks < 10 && testBtn.disabled) {
+                            addLog(`Processing rows... (${ticks * 10}k scanned)`);
+                        } else if (ticks === 10 && testBtn.disabled) {
+                            addLog('Applying Hub/DC exact match filters...');
+                        }
+                    }, 800);
+                }, 1000);
+            };
+
+            xhr.onload = async () => {
+                clearInterval(logInterval);
+                progressGroup.style.display = 'none';
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    addLog('✅ Success! CSV generated. Initiating download...');
+                    const blob = xhr.response;
                     const url = window.URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
@@ -230,17 +337,33 @@ async def test_page():
                     window.URL.revokeObjectURL(url);
                     showStatus('Success! Filtered CSV has been downloaded.', 'success');
                 } else {
-                    const errorJson = await response.json();
-                    showStatus(`Error ${response.status}: ${JSON.stringify(errorJson)}`, 'error');
+                    // Blob might be JSON error dict, read it out
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                        let errorMsg = reader.result;
+                        try {
+                            const parsed = JSON.parse(reader.result);
+                            errorMsg = JSON.stringify(parsed);
+                        } catch (e) {}
+                        showStatus(`Error ${xhr.status}: ${errorMsg}`, 'error');
+                    };
+                    reader.readAsText(xhr.response);
                 }
-            })
-            .catch(error => {
-                showStatus(`Request failed: ${error}`, 'error');
-            })
-            .finally(() => {
                 testBtn.disabled = false;
-            });
+            };
+
+            xhr.onerror = () => {
+                progressGroup.style.display = 'none';
+                showStatus('Network Error during upload or processing.', 'error');
+                testBtn.disabled = false;
+            };
+
+            xhr.send(formData);
         });
+
+        function addLog(msg) {
+            statusDiv.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+        }
 
         function showStatus(message, type) {
             statusDiv.textContent = message;
