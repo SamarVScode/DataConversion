@@ -6,3 +6,4 @@ pandas
 openpyxl
 xlrd
 pyxlsb
+xlsx2csv
