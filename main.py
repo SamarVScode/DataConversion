@@ -55,7 +55,7 @@ ALLOWED_DCS = {
 
 # Header Priorities
 DC_HEADERS = ["dc", "source dc", "source_dc", "dc_code", "dc code"]
-HUB_HEADERS = ["hubname", "hub name", "hub_name", "finalhub", "final hub"]
+HUB_HEADERS = ["hubname", "hub name", "hub_name", "finalhub", "final hub", "sourcehub", "source hub", "source_hub"]
 
 def cleanup_files(*file_paths: Path):
     """Background task to delete temporary files after the response is sent."""
@@ -386,112 +386,227 @@ async def process_file(
         log.error(f"[JOB {job_id}] Error saving file: {e}")
         raise HTTPException(status_code=500, detail="Failed to save uploaded file.")
 
-    # 3. Read Data & Select Sheet
-    try:
-        if ext == ".csv":
-            df = pd.read_csv(input_path)
-            if df.empty:
-                raise HTTPException(status_code=422, detail="CSV file is empty.")
-        else:
-            # Handle Excel formats
-            engine = None
-            if ext == ".xls": engine = "xlrd"
-            elif ext == ".xlsb": engine = "pyxlsb"
-            elif ext == ".xlsx": engine = "openpyxl"
+    # 3. Unified Streaming Processor
+    class UnifiedRowProcessor:
+        def __init__(self, out_path, j_id, s_name):
+            self.file_handle = open(out_path, "w", encoding="utf-8", newline="")
+            self.writer = csv.writer(self.file_handle)
+            self.j_id = j_id
+            self.s_name = s_name
+            self.first_row = True
+            self.strategy = None
+            self.target_col_idx = None
+            self.row_count = 0
+            self.match_count = 0
+            self.line_buffer = ""
+            self.error_headers = []
+
+        def write(self, data):
+            """Special helper for xlsx2csv which emits raw CSV string chunks."""
+            if isinstance(data, bytes):
+                data = data.decode('utf-8', errors='ignore')
+            self.line_buffer += data
+            if "\n" in self.line_buffer:
+                parts = self.line_buffer.split("\n")
+                for line in parts[:-1]:
+                    if line.strip():
+                        try:
+                            f_line = io.StringIO(line)
+                            row = next(csv.reader(f_line))
+                            self.process_row(row)
+                        except: pass
+                self.line_buffer = parts[-1]
+
+        def process_row(self, row):
+            """Core logic to filter a single row (list of values)."""
+            self.row_count += 1
+            if self.row_count % 10000 == 0:
+                log.info(f"[FILTER] ⏳ {self.s_name}: {self.row_count:,} rows processed, {self.match_count:,} matches so far")
+                
+            if not any(row): return # Skip empty rows
             
-            log.info(f"[JOB {job_id}] Opening Workbook with {engine} engine...")
-            excel_file = pd.ExcelFile(input_path, engine=engine)
+            if self.first_row:
+                self.first_row = False
+                # Cleanup headers: stringify, strip, lowercase
+                curr_headers = [str(h).strip() if h is not None else "" for h in row]
+                col_map = {h.lower(): i for i, h in enumerate(curr_headers)}
+                self.error_headers = curr_headers
+                
+                # Strategy Detection
+                for dc_h in DC_HEADERS:
+                    if dc_h in col_map:
+                        self.target_col_idx = col_map[dc_h]
+                        self.strategy = "dc"
+                        log.info(f"[JOB {self.j_id}] Strategy: DC Priority. Found column '{dc_h}'.")
+                        break
+                
+                if not self.strategy:
+                    for hub_h in HUB_HEADERS:
+                        if hub_h in col_map:
+                            self.target_col_idx = col_map[hub_h]
+                            self.strategy = "hub"
+                            log.info(f"[JOB {self.j_id}] Strategy: Hub Fallback. Found column '{hub_h}'.")
+                            break
+                
+                if not self.strategy:
+                    self.strategy = "error"
+                    raise ValueError("NO_VALID_HEADERS")
+                
+                self.writer.writerow(curr_headers)
+                return
+                
+            if self.strategy == "error": return
+            
+            if self.target_col_idx is not None and len(row) > self.target_col_idx:
+                raw_val = row[self.target_col_idx]
+                val = str(raw_val).strip().lower() if raw_val is not None else ""
+                
+                if self.strategy == "dc":
+                    if val in ALLOWED_DCS:
+                        self.match_count += 1
+                        self.writer.writerow(row)
+                elif self.strategy == "hub":
+                    val_prefix = val.split('_')[0]
+                    if val_prefix in ALLOWED_HUBS:
+                        self.match_count += 1
+                        self.writer.writerow(row)
+
+        def finalize(self):
+            # Finalize buffer for xlsx2csv if any
+            if self.line_buffer.strip():
+                try:
+                    f_line = io.StringIO(self.line_buffer)
+                    row = next(csv.reader(f_line))
+                    self.process_row(row)
+                except: pass
+            self.line_buffer = ""
+            self.file_handle.close()
+
+    try:
+        # Format fork
+        if ext == ".csv":
+            log.info(f"[JOB {job_id}] Processing CSV via streaming reader...")
+            best_sheet = "CSV"
+            f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
+            with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    f_processor.process_row(row)
+            f_processor.finalize()
+            log.info(f"[JOB {job_id}] ✅ Complete. Kept {f_processor.match_count:,} rows.")
+
+        elif ext == ".xlsx":
+            import xlsx2csv
+            log.info(f"[JOB {job_id}] Scanning XLSX structure...")
+            excel_file = pd.ExcelFile(input_path, engine="openpyxl")
+            sheet_names = excel_file.sheet_names
+            
+            # Fast-path sheet selection
             best_sheet = None
-            max_cells = -1
-
-            # 1) Fast-path: check if a "Raw" or "Raw Data" sheet exists
             RAW_SHEET_CANDIDATES = {"raw", "raw data", "raw_data", "row data", "row_data"}
-            for sheet_name in excel_file.sheet_names:
-                if sheet_name.strip().lower() in RAW_SHEET_CANDIDATES:
-                    best_sheet = sheet_name
-                    log.info(f"[JOB {job_id}] Fast-path trigger: Found explicit raw data sheet '{best_sheet}'.")
+            for name in sheet_names:
+                if name.strip().lower() in RAW_SHEET_CANDIDATES:
+                    best_sheet = name
+                    log.info(f"[JOB {job_id}] Fast-path: Selected '{best_sheet}'.")
                     break
-
-            # 2) Slow-path: If no explicit raw sheet, find the sheet with max data
+            
             if not best_sheet:
-                log.info(f"[JOB {job_id}] Scanning sheets to find the largest dataset...")
-                for sheet_name in excel_file.sheet_names:
-                    df_test = pd.read_excel(excel_file, sheet_name=sheet_name)
-                    # Count non-null cells
-                    cell_count = df_test.notna().sum().sum()
-                    if cell_count > max_cells:
-                        max_cells = cell_count
-                        best_sheet = sheet_name
-                    # explicit memory cleanup
-                    del df_test
-
+                log.info(f"[JOB {job_id}] Scoring sheets by row count...")
+                max_rows = -1
+                for name in sheet_names:
+                    # Optimized: load only the index to count rows quickly
+                    df_temp = pd.read_excel(excel_file, sheet_name=name, usecols=[0])
+                    rows = len(df_temp)
+                    if rows > max_rows:
+                        max_rows = rows
+                        best_sheet = name
+                    del df_temp
                 gc.collect()
 
-            if best_sheet is None:
-                raise HTTPException(status_code=422, detail="No data found in any Excel sheet.")
-
-            log.info(f"[JOB {job_id}] Selected sheet '{best_sheet}' with {max_cells} valid cells.")
-            
-            log.info(f"[JOB {job_id}] Loading sheet into memory. This may take a moment for large files...")
-            df = pd.read_excel(excel_file, sheet_name=best_sheet)
+            s_idx = sheet_names.index(best_sheet) + 1
             excel_file.close()
 
-    except HTTPException:
-        raise
+            f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
+            log.info(f"[JOB {job_id}] Streaming XLSX filter via xlsx2csv...")
+            xlsx2csv.Xlsx2csv(str(input_path), skip_empty_lines=True).convert(f_processor, sheetid=s_idx)
+            f_processor.finalize()
+            log.info(f"[JOB {job_id}] ✅ Complete. Kept {f_processor.match_count:,} rows.")
+
+        elif ext == ".xlsb":
+            from pyxlsb import open_workbook
+            log.info(f"[JOB {job_id}] Opening XLSB with streaming reader...")
+            best_sheet = None
+            with open_workbook(str(input_path)) as wb:
+                sheet_names = wb.sheets
+                
+                # Fast-path
+                RAW_SHEET_CANDIDATES = {"raw", "raw data", "raw_data", "row data", "row_data"}
+                for name in sheet_names:
+                    if name.strip().lower() in RAW_SHEET_CANDIDATES:
+                        best_sheet = name
+                        break
+                
+                if not best_sheet:
+                    log.info(f"[JOB {job_id}] Scoring XLSB sheets by row count...")
+                    max_rows = -1
+                    for name in sheet_names:
+                        row_count = 0
+                        with wb.get_sheet(name) as sheet:
+                            for _ in sheet.rows():
+                                row_count += 1
+                        if row_count > max_rows:
+                            max_rows = row_count
+                            best_sheet = name
+                    log.info(f"[JOB {job_id}] Selected largest XLSB sheet: '{best_sheet}' ({max_rows:,} rows)")
+                f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
+                with wb.get_sheet(best_sheet) as sheet:
+                    for row in sheet.rows():
+                        # row is a list of Cell objects
+                        f_processor.process_row([c.v for c in row])
+                f_processor.finalize()
+                log.info(f"[JOB {job_id}] ✅ Complete. Kept {f_processor.match_count:,} rows.")
+
+        elif ext == ".xls":
+            import xlrd
+            log.info(f"[JOB {job_id}] Opening XLS (Legacy format)...")
+            wb = xlrd.open_workbook(input_path)
+            sheet_names = wb.sheet_names()
+            
+            best_sheet = None
+            RAW_SHEET_CANDIDATES = {"raw", "raw data", "raw_data", "row data", "row_data"}
+            for name in sheet_names:
+                if name.strip().lower() in RAW_SHEET_CANDIDATES:
+                    best_sheet = name
+                    break
+            
+            if not best_sheet:
+                # Find sheet with most rows
+                max_rows = -1
+                for name in sheet_names:
+                    s = wb.sheet_by_name(name)
+                    if s.nrows > max_rows:
+                        max_rows = s.nrows
+                        best_sheet = name
+            
+            log.info(f"[JOB {job_id}] Selected XLS sheet: '{best_sheet}'")
+            sheet = wb.sheet_by_name(best_sheet)
+            f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
+            for i in range(sheet.nrows):
+                f_processor.process_row(sheet.row_values(i))
+            f_processor.finalize()
+            log.info(f"[JOB {job_id}] ✅ Complete. Kept {f_processor.match_count:,} rows.")
+
+    except ValueError as ve:
+        if "NO_VALID_HEADERS" in str(ve):
+            # Try to report what we found
+            hdrs = f_processor.error_headers if 'f_processor' in locals() else "Unknown"
+            raise HTTPException(status_code=400, detail=f"No valid DC or Hub column found. Detected headers: {hdrs}")
+        raise HTTPException(status_code=422, detail=str(ve))
     except Exception as e:
-        log.error(f"[JOB {job_id}] File parsing error: {e}")
-        raise HTTPException(status_code=422, detail=f"Could not parse file: str{e}")
+        log.error(f"[JOB {job_id}] Processing error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal processing failed: {str(e)}")
 
-    # 4. Header Detection & Priority Resolution
-    columns = list(df.columns)
-    columns_lower = {str(col).lower().strip(): col for col in columns}
-
-    dc_col_actual = None
-    hub_col_actual = None
-
-    # Search for DC Headers (High Priority)
-    for dc_h in DC_HEADERS:
-        if dc_h in columns_lower:
-            dc_col_actual = columns_lower[dc_h]
-            break
-
-    # If no DC found, search for Hub Headers (Fallback)
-    if not dc_col_actual:
-        for hub_h in HUB_HEADERS:
-            if hub_h in columns_lower:
-                hub_col_actual = columns_lower[hub_h]
-                break
-
-    if dc_col_actual:
-        log.info(f"[JOB {job_id}] Strategy: DC Priority. Found column '{dc_col_actual}'.")
-        log.info(f"[JOB {job_id}] ⏳ Scanning {len(df):,} rows...")
-        # Ensure string type, then trim and lower for matching
-        df['__match_col'] = df[dc_col_actual].astype(str).str.strip().str.lower()
-        df_filtered = df[df['__match_col'].isin(ALLOWED_DCS)]
-        df_filtered = df_filtered.drop(columns=['__match_col'])
-        log.info(f"[JOB {job_id}] ✅ Filter complete. Kept {len(df_filtered):,} matching rows.")
-    elif hub_col_actual:
-        log.info(f"[JOB {job_id}] Strategy: Hub Fallback. Found column '{hub_col_actual}'.")
-        log.info(f"[JOB {job_id}] ⏳ Scanning {len(df):,} rows...")
-        # Split by underscore and take the first part to handle "AligarhMYNTRAHUB_ALG" -> "aligarhmyntrahub"
-        df['__match_col'] = df[hub_col_actual].astype(str).str.strip().str.lower().apply(lambda x: x.split('_')[0])
-        df_filtered = df[df['__match_col'].isin(ALLOWED_HUBS)]
-        df_filtered = df_filtered.drop(columns=['__match_col'])
-        log.info(f"[JOB {job_id}] ✅ Filter complete. Kept {len(df_filtered):,} matching rows.")
-    else:
-        raise HTTPException(status_code=400, detail=f"No valid DC or Hub column found. Detected headers: {columns}")
-
-    # 5. Export CSV
-    try:
-        df_filtered.to_csv(output_path, index=False, encoding='utf-8')
-    except Exception as e:
-        log.error(f"[JOB {job_id}] CSV generation error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to write CSV output.")
-
-    # Explicit memory cleanup
-    del df
-    del df_filtered
-    gc.collect()
+    log.info(f"[JOB {job_id}] Processing complete. Ready for download.")
 
     log.info(f"[JOB {job_id}] Processing complete. Ready for download.")
 
