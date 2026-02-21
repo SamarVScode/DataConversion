@@ -54,7 +54,7 @@ ALLOWED_DCS = {
 
 # Header Priorities
 DC_HEADERS = ["dc", "source dc", "source_dc", "dc_code", "dc code"]
-HUB_HEADERS = ["hubname", "hub name", "finalhub", "final hub"]
+HUB_HEADERS = ["hubname", "hub name", "hub_name", "finalhub", "final hub"]
 
 def cleanup_files(*file_paths: Path):
     """Background task to delete temporary files after the response is sent."""
@@ -356,7 +356,7 @@ async def process_file(
         df_filtered = df[df['__match_col'].isin(ALLOWED_HUBS)]
         df_filtered = df_filtered.drop(columns=['__match_col'])
     else:
-        raise HTTPException(status_code=400, detail="No valid DC or Hub column found in the dataset.")
+        raise HTTPException(status_code=400, detail=f"No valid DC or Hub column found. Detected headers: {columns}")
 
     # 5. Export CSV
     try:
