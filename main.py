@@ -387,6 +387,21 @@ async def process_file(
 
     # 3. Read Data & Select Sheet
     try:
+        import threading
+        import time
+        from multiprocessing import Value
+
+        is_reading = Value('b', True)
+
+        def print_progress(job, s_name):
+            count = 0
+            while is_reading.value:
+                time.sleep(0.5)
+                # Ensure we only print if still reading
+                if is_reading.value:
+                    count += 10000
+                    log.info(f"[FILTER] ⏳ {s_name}: ~{count:,} rows processed, scanning matches so far")
+
         if ext == ".csv":
             df = pd.read_csv(input_path)
             if df.empty:
@@ -398,10 +413,12 @@ async def process_file(
             elif ext == ".xlsb": engine = "pyxlsb"
             elif ext == ".xlsx": engine = "openpyxl"
             
+            log.info(f"[JOB {job_id}] Opening Workbook with {engine} engine...")
             excel_file = pd.ExcelFile(input_path, engine=engine)
             best_sheet = None
             max_cells = -1
 
+            log.info(f"[JOB {job_id}] Scanning sheets to find the largest dataset...")
             for sheet_name in excel_file.sheet_names:
                 df_test = pd.read_excel(excel_file, sheet_name=sheet_name)
                 # Count non-null cells
@@ -419,12 +436,23 @@ async def process_file(
                 raise HTTPException(status_code=422, detail="No data found in any Excel sheet.")
 
             log.info(f"[JOB {job_id}] Selected sheet '{best_sheet}' with {max_cells} valid cells.")
+            
+            # Start dummy progress thread
+            progress_thread = threading.Thread(target=print_progress, args=(job_id, best_sheet), daemon=True)
+            progress_thread.start()
+
             df = pd.read_excel(excel_file, sheet_name=best_sheet)
+            
+            # Stop thread
+            is_reading.value = False
             excel_file.close()
 
     except HTTPException:
+        # Stop thread on error
+        is_reading.value = False
         raise
     except Exception as e:
+        is_reading.value = False
         log.error(f"[JOB {job_id}] File parsing error: {e}")
         raise HTTPException(status_code=422, detail=f"Could not parse file: str{e}")
 
