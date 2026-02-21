@@ -64,9 +64,50 @@ def cleanup_files(*file_paths: Path):
         except Exception as e:
             log.error(f"[CLEANUP] Error deleting {path}: {e}")
 
+# In-memory job state store
+# { job_id: { "status": "processing"|"done"|"error", "error": str, "output_path": Path } }
+JOB_STORE: dict = {}
+
 @app.get("/")
 async def root():
     return {"status": "ready", "message": "Stateless XLSX-to-CSV server running. Visit /test for UI."}
+
+@app.get("/status/{job_id}")
+async def job_status(job_id: str):
+    job = JOB_STORE.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "error": job.get("error"),
+    }
+
+@app.get("/download/{job_id}")
+async def job_download(job_id: str, background_tasks: BackgroundTasks):
+    job = JOB_STORE.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] == "processing":
+        raise HTTPException(status_code=202, detail="Still processing")
+    if job["status"] == "error":
+        raise HTTPException(status_code=500, detail=job.get("error", "Processing failed"))
+
+    output_path = job["output_path"]
+    if not output_path or not output_path.exists():
+        raise HTTPException(status_code=404, detail="Output file not found")
+
+    # Cleanup after download
+    input_path = job.get("input_path")
+    background_tasks.add_task(cleanup_files, output_path, input_path)
+    background_tasks.add_task(lambda: JOB_STORE.pop(job_id, None))
+
+    return FileResponse(
+        path=output_path,
+        media_type="text/csv",
+        filename=f"filtered_{job_id}.csv",
+        headers={"X-Job-ID": job_id}
+    )
 
 @app.get("/test", response_class=HTMLResponse)
 async def test_page():
@@ -205,27 +246,39 @@ async def test_page():
         const convertLabel = document.getElementById('convertLabel');
         const convertBarContainer = document.getElementById('convertBarContainer');
 
+        let pollInterval = null;
+
         testBtn.addEventListener('click', () => {
             const bridgeUrl = document.getElementById('bridgeUrl').value.trim();
             const jobId = document.getElementById('jobId').value.trim();
             const fileInput = document.getElementById('fileInput');
+
             if (!jobId) { showStatus('Job ID is required.', 'error'); return; }
             if (!fileInput.files.length) { showStatus('Please select a file first.', 'error'); return; }
+
             const file = fileInput.files[0];
             const formData = new FormData();
             formData.append('job_id', jobId);
             formData.append('file', file);
-            const uploadUrl = `${bridgeUrl}/process`;
-            statusDiv.style.display = 'none';
+
+            // Reset UI
+            statusDiv.style.display = 'block';
+            statusDiv.className = 'info';
+            statusDiv.innerHTML = '<strong>Server Logs:</strong><br>';
             progressGroup.style.display = 'block';
             convertLabel.style.display = 'none';
             convertBarContainer.style.display = 'none';
             uploadBar.style.width = '0%';
             uploadPct.textContent = '0%';
             testBtn.disabled = true;
+            if (pollInterval) clearInterval(pollInterval);
+
+            addLog('Connecting to server...');
+
+            // --- STEP 1: Upload file via XHR for progress tracking ---
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', uploadUrl, true);
-            xhr.responseType = 'blob';
+            xhr.open('POST', `${bridgeUrl}/process`, true);
+
             xhr.upload.onprogress = (e) => {
                 if (e.lengthComputable) {
                     const percent = Math.round((e.loaded / e.total) * 100);
@@ -235,104 +288,117 @@ async def test_page():
                         setTimeout(() => {
                             convertLabel.style.display = 'flex';
                             convertBarContainer.style.display = 'block';
-                            addLog('Upload complete. Parsing sheets...');
+                            addLog('✅ Upload complete. Server is now processing in background...');
+                            addLog('⏳ Polling for result every 4 seconds...');
                         }, 200);
                     }
                 }
             };
-            xhr.onloadstart = () => {
-                statusDiv.style.display = 'block';
-                statusDiv.className = 'info';
-                statusDiv.innerHTML = '<strong>Server Logs:</strong><br>';
-                addLog('Connecting to server...');
-                addLog('Upload started. Check your Python terminal for live processing logs once upload finishes!');
-            };
-            xhr.onload = async () => {
-                progressGroup.style.display = 'none';
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    addLog('✅ Success! CSV generated. Initiating download...');
-                    const blob = xhr.response;
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `filtered_${jobId}.csv`;
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
-                    window.URL.revokeObjectURL(url);
-                    showStatus('Success! Filtered CSV has been downloaded.', 'success');
+
+            xhr.onload = () => {
+                if (xhr.status === 200 || xhr.status === 202) {
+                    let resp;
+                    try { resp = JSON.parse(xhr.responseText); } catch(e) {
+                        showStatus('Unexpected server response.', 'error');
+                        testBtn.disabled = false;
+                        return;
+                    }
+                    addLog(`🆔 Job accepted: ${resp.job_id}`);
+                    // --- STEP 2: Poll /status until done ---
+                    startPolling(bridgeUrl, resp.job_id);
                 } else {
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                        let errorMsg = reader.result;
-                        try { const parsed = JSON.parse(reader.result); errorMsg = JSON.stringify(parsed); } catch (e) {}
-                        showStatus(`Error ${xhr.status}: ${errorMsg}`, 'error');
-                    };
-                    reader.readAsText(xhr.response);
+                    let errMsg = xhr.responseText;
+                    try { errMsg = JSON.parse(xhr.responseText).detail || errMsg; } catch(e) {}
+                    showStatus(`Upload failed (${xhr.status}): ${errMsg}`, 'error');
+                    testBtn.disabled = false;
                 }
-                testBtn.disabled = false;
             };
+
             xhr.onerror = () => {
-                progressGroup.style.display = 'none';
-                showStatus('Network Error during upload or processing.', 'error');
+                showStatus('Network error during upload.', 'error');
                 testBtn.disabled = false;
             };
+
             xhr.send(formData);
         });
-        function addLog(msg) { statusDiv.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`; }
-        function showStatus(message, type) { statusDiv.textContent = message; statusDiv.className = type; statusDiv.style.display = 'block'; }
+
+        function startPolling(bridgeUrl, jobId) {
+            let elapsed = 0;
+            pollInterval = setInterval(async () => {
+                elapsed += 4;
+                try {
+                    const res = await fetch(`${bridgeUrl}/status/${jobId}`);
+                    const data = await res.json();
+
+                    if (data.status === 'processing') {
+                        addLog(`⏳ Still processing... (${elapsed}s elapsed)`);
+
+                    } else if (data.status === 'done') {
+                        clearInterval(pollInterval);
+                        addLog('✅ Processing complete! Downloading CSV...');
+                        progressGroup.style.display = 'none';
+                        // --- STEP 3: Download the result ---
+                        triggerDownload(bridgeUrl, jobId);
+
+                    } else if (data.status === 'error') {
+                        clearInterval(pollInterval);
+                        progressGroup.style.display = 'none';
+                        showStatus(`❌ Server error: ${data.error}`, 'error');
+                        testBtn.disabled = false;
+                    }
+                } catch (e) {
+                    addLog(`⚠️ Poll failed, retrying... (${e.message})`);
+                }
+            }, 4000);
+        }
+
+        async function triggerDownload(bridgeUrl, jobId) {
+            try {
+                const res = await fetch(`${bridgeUrl}/download/${jobId}`);
+                if (!res.ok) {
+                    const err = await res.json();
+                    showStatus(`Download failed: ${err.detail}`, 'error');
+                    testBtn.disabled = false;
+                    return;
+                }
+                const blob = await res.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `filtered_${jobId}.csv`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                window.URL.revokeObjectURL(url);
+                showStatus('✅ Success! Filtered CSV has been downloaded.', 'success');
+            } catch(e) {
+                showStatus(`Download error: ${e.message}`, 'error');
+            }
+            testBtn.disabled = false;
+        }
+
+        function addLog(msg) {
+            statusDiv.style.display = 'block';
+            statusDiv.className = 'info';
+            statusDiv.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+        }
+        function showStatus(message, type) {
+            statusDiv.textContent = message;
+            statusDiv.className = type;
+            statusDiv.style.display = 'block';
+        }
     </script>
 </body>
 </html>
     """
 
-@app.post("/process")
-async def process_file(
-    background_tasks: BackgroundTasks,
-    job_id: str = Form(..., description="Unique Job ID for processing"),
-    file: UploadFile = File(..., description="Excel or CSV file from Drive")
-):
-    # Sanitize job_id to prevent path traversal
-    job_id = job_id.replace("/", "").replace(".", "").replace("\\", "")
-
+def run_processing(job_id: str, input_path: Path, output_path: Path, ext: str):
+    """Runs in a background thread. Updates JOB_STORE on completion or failure."""
+    import threading
+    log.info(f"[JOB {job_id}] 🔄 Background thread started: {threading.current_thread().name}")
     job_start = time.time()
-    log.info(f"")
-    log.info(f"[JOB {job_id}] ═══════════════════════════════════════════")
-    log.info(f"[JOB {job_id}] 🆕 NEW REQUEST RECEIVED")
-    log.info(f"[JOB {job_id}] File      : {file.filename}")
-    log.info(f"[JOB {job_id}] Content-Type: {file.content_type}")
-    log.info(f"[JOB {job_id}] ═══════════════════════════════════════════")
 
-    # 1. Validate File Ext
-    ext = Path(file.filename).suffix.lower()
-    if ext not in [".xlsx", ".xls", ".xlsb", ".csv"]:
-        log.warning(f"[JOB {job_id}] ❌ Rejected unsupported file type: {ext}")
-        raise HTTPException(status_code=415, detail=f"Unsupported file type: {ext}. Allowed: .xlsx, .xls, .xlsb, .csv")
-
-    log.info(f"[JOB {job_id}] ✅ File type validated: {ext}")
-
-    input_path = CACHE_DIR / f"{job_id}_input{ext}"
-    output_path = CACHE_DIR / f"{job_id}_output.csv"
-
-    background_tasks.add_task(cleanup_files, input_path, output_path)
-
-    # 2. Save stream to disk
-    log.info(f"[JOB {job_id}] 💾 Saving uploaded file to disk: {input_path}")
-    save_start = time.time()
-    try:
-        total_bytes = 0
-        with open(input_path, "wb") as f:
-            while chunk := await file.read(8192):
-                f.write(chunk)
-                total_bytes += len(chunk)
-        save_elapsed = time.time() - save_start
-        size_mb = total_bytes / (1024 * 1024)
-        log.info(f"[JOB {job_id}] ✅ File saved: {size_mb:.2f} MB in {save_elapsed:.2f}s")
-    except Exception as e:
-        log.error(f"[JOB {job_id}] ❌ Error saving file: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save uploaded file.")
-
-    # 3. Unified Streaming Processor
+    # Unified Streaming Processor
     class UnifiedRowProcessor:
         def __init__(self, out_path, j_id, s_name):
             self.file_handle = open(out_path, "w", encoding="utf-8", newline="")
@@ -350,7 +416,6 @@ async def process_file(
             log.info(f"[JOB {j_id}] 🔧 Processor initialized for sheet: '{s_name}'")
 
         def write(self, data):
-            """Special helper for xlsx2csv which emits raw CSV string chunks."""
             if isinstance(data, bytes):
                 data = data.decode('utf-8', errors='ignore')
             self.line_buffer += data
@@ -366,10 +431,7 @@ async def process_file(
                 self.line_buffer = parts[-1]
 
         def process_row(self, row):
-            """Core logic to filter a single row (list of values)."""
             self.row_count += 1
-
-            # Log every 50,000 rows with timing and match rate
             if self.row_count % 50000 == 0:
                 elapsed = time.time() - self.filter_start
                 rate = self.row_count / elapsed if elapsed > 0 else 0
@@ -381,18 +443,15 @@ async def process_file(
                     f"Speed: {rate:,.0f} rows/s | "
                     f"Elapsed: {elapsed:.1f}s"
                 )
-
-            if not any(row): return  # Skip empty rows
+            if not any(str(v).strip() for v in row if v is not None): return
 
             if self.first_row:
                 self.first_row = False
                 curr_headers = [str(h).strip() if h is not None else "" for h in row]
                 col_map = {h.lower(): i for i, h in enumerate(curr_headers)}
                 self.error_headers = curr_headers
-
                 log.info(f"[JOB {self.j_id}] 📋 Headers detected ({len(curr_headers)} columns): {curr_headers}")
 
-                # Strategy Detection
                 for dc_h in DC_HEADERS:
                     if dc_h in col_map:
                         self.target_col_idx = col_map[dc_h]
@@ -423,7 +482,6 @@ async def process_file(
             if self.target_col_idx is not None and len(row) > self.target_col_idx:
                 raw_val = row[self.target_col_idx]
                 val = str(raw_val).strip().lower() if raw_val is not None else ""
-
                 if self.strategy == "dc":
                     if val in ALLOWED_DCS:
                         self.match_count += 1
@@ -443,11 +501,9 @@ async def process_file(
                 except: pass
             self.line_buffer = ""
             self.file_handle.close()
-
             total_elapsed = time.time() - self.filter_start
             rate = self.row_count / total_elapsed if total_elapsed > 0 else 0
-            match_pct = (self.match_count / max(self.row_count - 1, 1)) * 100  # exclude header
-
+            match_pct = (self.match_count / max(self.row_count - 1, 1)) * 100
             log.info(f"[JOB {self.j_id}] ─────────────────────────────────────────")
             log.info(f"[JOB {self.j_id}] ✅ FILTER COMPLETE — Sheet: '{self.s_name}'")
             log.info(f"[JOB {self.j_id}]    Total rows scanned : {self.row_count - 1:,}")
@@ -459,21 +515,19 @@ async def process_file(
 
     f_processor = None
     try:
+        size_mb = input_path.stat().st_size / (1024 * 1024)
+
         if ext == ".csv":
             log.info(f"[JOB {job_id}] 📂 Format: CSV — Starting streaming reader...")
-            best_sheet = "CSV"
-            f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
+            f_processor = UnifiedRowProcessor(output_path, job_id, "CSV")
             with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
-                reader = csv.reader(f)
-                for row in reader:
+                for row in csv.reader(f):
                     f_processor.process_row(row)
             f_processor.finalize()
 
         elif ext == ".xlsx":
             from openpyxl import load_workbook
             log.info(f"[JOB {job_id}] 📂 Format: XLSX — Scanning sheet structure (openpyxl read-only)...")
-
-            # Open in read_only mode just to get sheet names — very fast, no data loaded
             wb_meta = load_workbook(str(input_path), read_only=True, data_only=True)
             sheet_names = wb_meta.sheetnames
             log.info(f"[JOB {job_id}] 📑 Sheets found ({len(sheet_names)}): {sheet_names}")
@@ -487,13 +541,12 @@ async def process_file(
                     break
 
             if not best_sheet:
-                log.info(f"[JOB {job_id}] 🔎 No 'raw' sheet found. Scoring sheets by row count (read-only scan)...")
+                log.info(f"[JOB {job_id}] 🔎 No 'raw' sheet found. Scoring sheets by row count...")
                 max_rows = -1
                 for name in sheet_names:
                     ws = wb_meta[name]
-                    # max_row from worksheet dimensions — instant, no data read
                     rows = ws.max_row or 0
-                    log.info(f"[JOB {job_id}]    Sheet '{name}': ~{rows:,} rows (dimension estimate)")
+                    log.info(f"[JOB {job_id}]    Sheet '{name}': ~{rows:,} rows")
                     if rows > max_rows:
                         max_rows = rows
                         best_sheet = name
@@ -503,12 +556,9 @@ async def process_file(
 
             log.info(f"[JOB {job_id}] 🚀 Starting openpyxl read-only streaming filter on sheet '{best_sheet}'...")
             f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
-
-            # Re-open in read_only mode for actual streaming — never loads full file into RAM
             wb = load_workbook(str(input_path), read_only=True, data_only=True)
             ws = wb[best_sheet]
             for row in ws.iter_rows():
-                # Extract cell values, convert None to empty string
                 f_processor.process_row([cell.value for cell in row])
             wb.close()
             f_processor.finalize()
@@ -520,14 +570,12 @@ async def process_file(
             with open_workbook(str(input_path)) as wb:
                 sheet_names = wb.sheets
                 log.info(f"[JOB {job_id}] 📑 Sheets found ({len(sheet_names)}): {sheet_names}")
-
                 RAW_SHEET_CANDIDATES = {"raw", "raw data", "raw_data", "row data", "row_data"}
                 for name in sheet_names:
                     if name.strip().lower() in RAW_SHEET_CANDIDATES:
                         best_sheet = name
                         log.info(f"[JOB {job_id}] ⚡ Fast-path match: Selected sheet '{best_sheet}'")
                         break
-
                 if not best_sheet:
                     log.info(f"[JOB {job_id}] 🔎 No 'raw' sheet found. Scoring XLSB sheets by row count...")
                     max_rows = -1
@@ -541,7 +589,6 @@ async def process_file(
                             max_rows = row_count
                             best_sheet = name
                     log.info(f"[JOB {job_id}] 🏆 Selected largest sheet: '{best_sheet}' ({max_rows:,} rows)")
-
                 log.info(f"[JOB {job_id}] 🚀 Starting XLSB streaming filter on sheet '{best_sheet}'...")
                 f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
                 with wb.get_sheet(best_sheet) as sheet:
@@ -555,7 +602,6 @@ async def process_file(
             wb = xlrd.open_workbook(input_path)
             sheet_names = wb.sheet_names()
             log.info(f"[JOB {job_id}] 📑 Sheets found ({len(sheet_names)}): {sheet_names}")
-
             best_sheet = None
             RAW_SHEET_CANDIDATES = {"raw", "raw data", "raw_data", "row data", "row_data"}
             for name in sheet_names:
@@ -563,7 +609,6 @@ async def process_file(
                     best_sheet = name
                     log.info(f"[JOB {job_id}] ⚡ Fast-path match: Selected sheet '{best_sheet}'")
                     break
-
             if not best_sheet:
                 log.info(f"[JOB {job_id}] 🔎 No 'raw' sheet found. Scoring XLS sheets by row count...")
                 max_rows = -1
@@ -574,7 +619,6 @@ async def process_file(
                         max_rows = s.nrows
                         best_sheet = name
                 log.info(f"[JOB {job_id}] 🏆 Selected largest sheet: '{best_sheet}' ({max_rows:,} rows)")
-
             log.info(f"[JOB {job_id}] 🚀 Starting XLS row-by-row filter on sheet '{best_sheet}'...")
             sheet = wb.sheet_by_name(best_sheet)
             f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
@@ -582,34 +626,81 @@ async def process_file(
                 f_processor.process_row(sheet.row_values(i))
             f_processor.finalize()
 
-    except ValueError as ve:
-        if "NO_VALID_HEADERS" in str(ve):
-            hdrs = f_processor.error_headers if f_processor else "Unknown"
-            log.error(f"[JOB {job_id}] ❌ Header detection failed. Found: {hdrs}")
-            raise HTTPException(status_code=400, detail=f"No valid DC or Hub column found. Detected headers: {hdrs}")
-        raise HTTPException(status_code=422, detail=str(ve))
+        out_size = output_path.stat().st_size if output_path.exists() else 0
+        total_elapsed = time.time() - job_start
+        log.info(f"[JOB {job_id}] ═══════════════════════════════════════════")
+        log.info(f"[JOB {job_id}] 🎉 JOB COMPLETE")
+        log.info(f"[JOB {job_id}]    Input size  : {size_mb:.2f} MB")
+        log.info(f"[JOB {job_id}]    Output size : {out_size / 1024:.2f} KB")
+        log.info(f"[JOB {job_id}]    Total time  : {total_elapsed:.2f}s")
+        log.info(f"[JOB {job_id}] ═══════════════════════════════════════════")
+
+        JOB_STORE[job_id]["status"] = "done"
+        JOB_STORE[job_id]["output_path"] = output_path
+
     except Exception as e:
-        log.error(f"[JOB {job_id}] ❌ Processing error: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal processing failed: {str(e)}")
+        err_msg = f"{type(e).__name__}: {e}"
+        log.error(f"[JOB {job_id}] ❌ Processing error: {err_msg}")
+        JOB_STORE[job_id]["status"] = "error"
+        JOB_STORE[job_id]["error"] = err_msg
+        cleanup_files(input_path, output_path)
 
-    # Output file size
-    out_size = output_path.stat().st_size if output_path.exists() else 0
-    total_elapsed = time.time() - job_start
 
-    log.info(f"[JOB {job_id}] ═══════════════════════════════════════════")
-    log.info(f"[JOB {job_id}] 🎉 JOB COMPLETE")
-    log.info(f"[JOB {job_id}]    Input size  : {size_mb:.2f} MB")
-    log.info(f"[JOB {job_id}]    Output size : {out_size / 1024:.2f} KB")
-    log.info(f"[JOB {job_id}]    Total time  : {total_elapsed:.2f}s")
-    log.info(f"[JOB {job_id}] ═══════════════════════════════════════════")
+@app.post("/process")
+async def process_file(
+    background_tasks: BackgroundTasks,
+    job_id: str = Form(..., description="Unique Job ID for processing"),
+    file: UploadFile = File(..., description="Excel or CSV file from Drive")
+):
+    # Sanitize job_id
+    job_id = job_id.replace("/", "").replace(".", "").replace("\\", "")
+
     log.info(f"")
+    log.info(f"[JOB {job_id}] ═══════════════════════════════════════════")
+    log.info(f"[JOB {job_id}] 🆕 NEW REQUEST RECEIVED")
+    log.info(f"[JOB {job_id}] File        : {file.filename}")
+    log.info(f"[JOB {job_id}] Content-Type: {file.content_type}")
+    log.info(f"[JOB {job_id}] ═══════════════════════════════════════════")
 
-    return FileResponse(
-        path=output_path,
-        media_type="text/csv",
-        filename=f"filtered_{job_id}.csv",
-        headers={"X-Job-ID": job_id}
-    )
+    ext = Path(file.filename).suffix.lower()
+    if ext not in [".xlsx", ".xls", ".xlsb", ".csv"]:
+        log.warning(f"[JOB {job_id}] ❌ Rejected unsupported file type: {ext}")
+        raise HTTPException(status_code=415, detail=f"Unsupported file type: {ext}. Allowed: .xlsx, .xls, .xlsb, .csv")
+
+    log.info(f"[JOB {job_id}] ✅ File type validated: {ext}")
+
+    input_path = CACHE_DIR / f"{job_id}_input{ext}"
+    output_path = CACHE_DIR / f"{job_id}_output.csv"
+
+    # Save uploaded file to disk
+    log.info(f"[JOB {job_id}] 💾 Saving uploaded file to disk...")
+    try:
+        total_bytes = 0
+        with open(input_path, "wb") as f:
+            while chunk := await file.read(8192):
+                f.write(chunk)
+                total_bytes += len(chunk)
+        size_mb = total_bytes / (1024 * 1024)
+        log.info(f"[JOB {job_id}] ✅ File saved: {size_mb:.2f} MB")
+    except Exception as e:
+        log.error(f"[JOB {job_id}] ❌ Error saving file: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file.")
+
+    # Register job as processing
+    JOB_STORE[job_id] = {
+        "status": "processing",
+        "output_path": None,
+        "input_path": input_path,
+        "error": None,
+    }
+
+    # Kick off processing in background thread (non-blocking)
+    import asyncio
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, run_processing, job_id, input_path, output_path, ext)
+
+    log.info(f"[JOB {job_id}] 🚀 Job queued. Returning 202 to client immediately.")
+    return {"job_id": job_id, "status": "processing", "message": "Job accepted. Poll /status/{job_id} for updates."}
 
 if __name__ == "__main__":
     import uvicorn
