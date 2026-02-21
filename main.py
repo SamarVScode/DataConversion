@@ -418,21 +418,31 @@ async def process_file(
             best_sheet = None
             max_cells = -1
 
-            log.info(f"[JOB {job_id}] Scanning sheets to find the largest dataset...")
+            # 1) Fast-path: check if a "Raw" or "Raw Data" sheet exists
+            RAW_SHEET_CANDIDATES = {"raw", "raw data", "raw_data", "row data", "row_data"}
             for sheet_name in excel_file.sheet_names:
-                df_test = pd.read_excel(excel_file, sheet_name=sheet_name)
-                # Count non-null cells
-                cell_count = df_test.notna().sum().sum()
-                if cell_count > max_cells:
-                    max_cells = cell_count
+                if sheet_name.strip().lower() in RAW_SHEET_CANDIDATES:
                     best_sheet = sheet_name
-                # explicit memory cleanup
-                del df_test
+                    log.info(f"[JOB {job_id}] Fast-path trigger: Found explicit raw data sheet '{best_sheet}'.")
+                    break
 
-            import gc
-            gc.collect()
+            # 2) Slow-path: If no explicit raw sheet, find the sheet with max data
+            if not best_sheet:
+                log.info(f"[JOB {job_id}] Scanning sheets to find the largest dataset...")
+                for sheet_name in excel_file.sheet_names:
+                    df_test = pd.read_excel(excel_file, sheet_name=sheet_name)
+                    # Count non-null cells
+                    cell_count = df_test.notna().sum().sum()
+                    if cell_count > max_cells:
+                        max_cells = cell_count
+                        best_sheet = sheet_name
+                    # explicit memory cleanup
+                    del df_test
 
-            if best_sheet is None or max_cells == 0:
+                import gc
+                gc.collect()
+
+            if best_sheet is None:
                 raise HTTPException(status_code=422, detail="No data found in any Excel sheet.")
 
             log.info(f"[JOB {job_id}] Selected sheet '{best_sheet}' with {max_cells} valid cells.")
