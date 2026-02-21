@@ -5,13 +5,10 @@ import logging
 import sys
 import time
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import numpy as np
-import gc
+
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -473,10 +470,12 @@ async def process_file(
             f_processor.finalize()
 
         elif ext == ".xlsx":
-            import xlsx2csv
-            log.info(f"[JOB {job_id}] 📂 Format: XLSX — Scanning sheet structure...")
-            excel_file = pd.ExcelFile(input_path, engine="openpyxl")
-            sheet_names = excel_file.sheet_names
+            from openpyxl import load_workbook
+            log.info(f"[JOB {job_id}] 📂 Format: XLSX — Scanning sheet structure (openpyxl read-only)...")
+
+            # Open in read_only mode just to get sheet names — very fast, no data loaded
+            wb_meta = load_workbook(str(input_path), read_only=True, data_only=True)
+            sheet_names = wb_meta.sheetnames
             log.info(f"[JOB {job_id}] 📑 Sheets found ({len(sheet_names)}): {sheet_names}")
 
             best_sheet = None
@@ -488,25 +487,30 @@ async def process_file(
                     break
 
             if not best_sheet:
-                log.info(f"[JOB {job_id}] 🔎 No 'raw' sheet found. Scoring sheets by row count...")
+                log.info(f"[JOB {job_id}] 🔎 No 'raw' sheet found. Scoring sheets by row count (read-only scan)...")
                 max_rows = -1
                 for name in sheet_names:
-                    df_temp = pd.read_excel(excel_file, sheet_name=name, usecols=[0])
-                    rows = len(df_temp)
-                    log.info(f"[JOB {job_id}]    Sheet '{name}': {rows:,} rows")
+                    ws = wb_meta[name]
+                    # max_row from worksheet dimensions — instant, no data read
+                    rows = ws.max_row or 0
+                    log.info(f"[JOB {job_id}]    Sheet '{name}': ~{rows:,} rows (dimension estimate)")
                     if rows > max_rows:
                         max_rows = rows
                         best_sheet = name
-                    del df_temp
-                gc.collect()
-                log.info(f"[JOB {job_id}] 🏆 Selected largest sheet: '{best_sheet}' ({max_rows:,} rows)")
+                log.info(f"[JOB {job_id}] 🏆 Selected largest sheet: '{best_sheet}' (~{max_rows:,} rows)")
 
-            s_idx = sheet_names.index(best_sheet) + 1
-            excel_file.close()
+            wb_meta.close()
 
-            log.info(f"[JOB {job_id}] 🚀 Starting xlsx2csv streaming filter on sheet '{best_sheet}' (index {s_idx})...")
+            log.info(f"[JOB {job_id}] 🚀 Starting openpyxl read-only streaming filter on sheet '{best_sheet}'...")
             f_processor = UnifiedRowProcessor(output_path, job_id, best_sheet)
-            xlsx2csv.Xlsx2csv(str(input_path), skip_empty_lines=True).convert(f_processor, sheetid=s_idx)
+
+            # Re-open in read_only mode for actual streaming — never loads full file into RAM
+            wb = load_workbook(str(input_path), read_only=True, data_only=True)
+            ws = wb[best_sheet]
+            for row in ws.iter_rows():
+                # Extract cell values, convert None to empty string
+                f_processor.process_row([cell.value for cell in row])
+            wb.close()
             f_processor.finalize()
 
         elif ext == ".xlsb":
