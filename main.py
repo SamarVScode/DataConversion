@@ -296,33 +296,15 @@ async def test_page():
                 }
             };
             
-            // Simulation of console logs while waiting for the server
-            let logInterval;
             xhr.onloadstart = () => {
                 statusDiv.style.display = 'block';
                 statusDiv.className = 'info';
                 statusDiv.innerHTML = '<strong>Server Logs:</strong><br>';
                 addLog('Connecting to server...');
-                
-                // Simulate process logs after upload completes
-                setTimeout(() => {
-                    if(!testBtn.disabled) return;
-                    addLog('Extracting dataset...');
-                    
-                    let ticks = 0;
-                    logInterval = setInterval(() => {
-                        ticks++;
-                        if (ticks < 10 && testBtn.disabled) {
-                            addLog(`Processing rows... (${ticks * 10}k scanned)`);
-                        } else if (ticks === 10 && testBtn.disabled) {
-                            addLog('Applying Hub/DC exact match filters...');
-                        }
-                    }, 800);
-                }, 1000);
+                addLog('Upload started. Check your Python terminal for live processing logs once upload finishes!');
             };
 
             xhr.onload = async () => {
-                clearInterval(logInterval);
                 progressGroup.style.display = 'none';
                 if (xhr.status >= 200 && xhr.status < 300) {
                     addLog('✅ Success! CSV generated. Initiating download...');
@@ -468,16 +450,20 @@ async def process_file(
 
     if dc_col_actual:
         log.info(f"[JOB {job_id}] Strategy: DC Priority. Found column '{dc_col_actual}'.")
+        log.info(f"[JOB {job_id}] ⏳ Scanning {len(df):,} rows...")
         # Ensure string type, then trim and lower for matching
         df['__match_col'] = df[dc_col_actual].astype(str).str.strip().str.lower()
         df_filtered = df[df['__match_col'].isin(ALLOWED_DCS)]
         df_filtered = df_filtered.drop(columns=['__match_col'])
+        log.info(f"[JOB {job_id}] ✅ Filter complete. Kept {len(df_filtered):,} matching rows.")
     elif hub_col_actual:
         log.info(f"[JOB {job_id}] Strategy: Hub Fallback. Found column '{hub_col_actual}'.")
+        log.info(f"[JOB {job_id}] ⏳ Scanning {len(df):,} rows...")
         # Split by underscore and take the first part to handle "AligarhMYNTRAHUB_ALG" -> "aligarhmyntrahub"
         df['__match_col'] = df[hub_col_actual].astype(str).str.strip().str.lower().apply(lambda x: x.split('_')[0])
         df_filtered = df[df['__match_col'].isin(ALLOWED_HUBS)]
         df_filtered = df_filtered.drop(columns=['__match_col'])
+        log.info(f"[JOB {job_id}] ✅ Filter complete. Kept {len(df_filtered):,} matching rows.")
     else:
         raise HTTPException(status_code=400, detail=f"No valid DC or Hub column found. Detected headers: {columns}")
 
