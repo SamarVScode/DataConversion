@@ -36,19 +36,44 @@ if not os.path.exists("/tmp"):
     CACHE_DIR = Path("tmp_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Master Lists (Case-Insensitive Exact Match Expected)
+# Master Lists (Case-Insensitive Match Expected)
 ALLOWED_HUBS = {
     "aligarhmyntrahub",
     "faizabadmyntrahub",
     "deoriamyntrahub",
     "jaunpurmyntrahub",
     "maumyntrahub",
-    "mirzapurmyntrahub"
+    "mirzapurmyntrahub",
+    "jhansimyntrahub",
+    "muzzafarnagarmyntrahub",
+    "mathuramyntrahub",
+    "saharanpurmyntrahub",
+    "raebarelimyntrahub"
 }
 
 ALLOWED_DCS = {
-    "alg", "ayp", "deo", "jnp", "mau", "mrz"
+    "alg", "ayp", "deo", "jnp", "mau", "mrz",
+    "jhs", "mzn", "mth", "spr", "rbr"
 }
+
+def is_valid_dc(raw_val: str) -> bool:
+    """Check if a DC code matches any allowed DC."""
+    if not raw_val:
+        return False
+    val = str(raw_val).strip().lower()
+    return val in ALLOWED_DCS
+
+def is_valid_hub(raw_val: str) -> bool:
+    """Check if a Hub name matches any allowed Hub after flexible normalization."""
+    if not raw_val:
+        return False
+    val = str(raw_val).strip().lower().replace(" ", "").replace("-", "")
+    if val in ALLOWED_HUBS:
+        return True
+    val_prefix = val.split('_')[0]
+    if val_prefix in ALLOWED_HUBS:
+        return True
+    return False
 
 # Header Priorities
 DC_HEADERS = ["dc", "source dc", "source_dc", "dc_code", "dc code"]
@@ -481,14 +506,12 @@ def run_processing(job_id: str, input_path: Path, output_path: Path, ext: str):
 
             if self.target_col_idx is not None and len(row) > self.target_col_idx:
                 raw_val = row[self.target_col_idx]
-                val = str(raw_val).strip().lower() if raw_val is not None else ""
                 if self.strategy == "dc":
-                    if val in ALLOWED_DCS:
+                    if is_valid_dc(raw_val):
                         self.match_count += 1
                         self.writer.writerow(row)
                 elif self.strategy == "hub":
-                    val_prefix = val.split('_')[0]
-                    if val_prefix in ALLOWED_HUBS:
+                    if is_valid_hub(raw_val):
                         self.match_count += 1
                         self.writer.writerow(row)
 
